@@ -1,11 +1,16 @@
 package config
 
 import (
+	"database/sql"
 	"fmt"
+	"log"
 	"os"
+	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/joho/godotenv"
-	"github.com/yourusername/gpay-remit/models"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -20,6 +25,11 @@ type Config struct {
 	NetworkPassphrase string
 	JWTSecret         string
 	JWTRefreshSecret  string
+
+	// Database connection pool settings
+	DBMaxIdleConns    int
+	DBMaxOpenConns    int
+	DBConnMaxLifetime time.Duration
 }
 
 func LoadConfig() (*Config, error) {
@@ -35,18 +45,50 @@ func LoadConfig() (*Config, error) {
 		NetworkPassphrase: getEnvOrDefault("NETWORK_PASSPHRASE", "Test SDF Network ; September 2015"),
 		JWTSecret:         getEnvOrDefault("JWT_SECRET", "super-secret-key-change-me"),
 		JWTRefreshSecret:  getEnvOrDefault("JWT_REFRESH_SECRET", "super-secret-refresh-key-change-me"),
+
+		DBMaxIdleConns:    getEnvAsInt("DB_MAX_IDLE_CONNS", 10),
+		DBMaxOpenConns:    getEnvAsInt("DB_MAX_OPEN_CONNS", 100),
+		DBConnMaxLifetime: time.Duration(getEnvAsInt("DB_CONN_MAX_LIFETIME_MIN", 60)) * time.Minute,
 	}, nil
 }
 
+func RunMigrations(databaseURL string) error {
+	m, err := migrate.New(
+		"file://migrations",
+		databaseURL,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create migration instance: %w", err)
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	log.Println("Database migrations completed successfully")
+	return nil
+}
+
 func InitDB(cfg *Config) (*gorm.DB, error) {
+	// Run migrations first
+	if err := RunMigrations(cfg.DatabaseURL); err != nil {
+		return nil, err
+	}
+
 	db, err := gorm.Open(postgres.Open(cfg.DatabaseURL), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	if err := db.AutoMigrate(&models.User{}, &models.Payment{}, &models.Invoice{}); err != nil {
-		return nil, fmt.Errorf("failed to migrate database: %w", err)
+	// Configure connection pool
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sql.DB: %w", err)
 	}
+
+	sqlDB.SetMaxIdleConns(cfg.DBMaxIdleConns)
+	sqlDB.SetMaxOpenConns(cfg.DBMaxOpenConns)
+	sqlDB.SetConnMaxLifetime(cfg.DBConnMaxLifetime)
 
 	return db, nil
 }
@@ -56,4 +98,14 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvAsInt(key string, defaultValue int) int {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		return defaultValue
+	}
+	var value int
+	fmt.Sscanf(valueStr, "%d", &value)
+	return value
 }
